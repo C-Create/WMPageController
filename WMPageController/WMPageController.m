@@ -14,9 +14,9 @@ NSString *const WMControllerDidFullyDisplayedNotification = @"WMControllerDidFul
 static NSInteger const kWMUndefinedIndex = -1;
 static NSInteger const kWMControllerCountUndefined = -1;
 @interface WMPageController () {
-    CGFloat _targetX, _superviewHeight;
+    CGFloat _targetX;
     CGRect  _contentViewFrame, _menuViewFrame;
-    BOOL    _hasInited, _shouldNotScroll, _isTabBarHidden;
+    BOOL    _hasInited, _shouldNotScroll;
     NSInteger _initializedIndex, _controllerCount, _markedSelectIndex;
 }
 @property (nonatomic, strong, readwrite) UIViewController *currentViewController;
@@ -59,18 +59,6 @@ static NSInteger const kWMControllerCountUndefined = -1;
 }
 
 #pragma mark - Public Methods
-
-- (instancetype)initWithViewControllerClasses:(NSArray<Class> *)classes andTheirTitles:(NSArray<NSString *> *)titles {
-    if (self = [super init]) {
-        NSParameterAssert(classes.count == titles.count);
-        _viewControllerClasses = [NSArray arrayWithArray:classes];
-        _titles = [NSArray arrayWithArray:titles];
-
-        [self wm_setup];
-    }
-    return self;
-}
-
 - (instancetype)initWithCoder:(NSCoder *)aDecoder {
     if (self = [super initWithCoder:aDecoder]) {
         [self wm_setup];
@@ -78,26 +66,35 @@ static NSInteger const kWMControllerCountUndefined = -1;
     return self;
 }
 
-- (instancetype)init {
-    if (self = [super init]) {
+- (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil {
+    if (self = [super initWithNibName:nibNameOrNil bundle:nibBundleOrNil]) {
         [self wm_setup];
     }
     return self;
 }
 
-- (void)setEdgesForExtendedLayout:(UIRectEdge)edgesForExtendedLayout {
-    if (self.edgesForExtendedLayout == edgesForExtendedLayout) return;
-    [super setEdgesForExtendedLayout:edgesForExtendedLayout];
-    
-    if (_hasInited) {
-        _hasInited = NO;
-        [self viewDidLayoutSubviews];
+- (instancetype)initWithViewControllerClasses:(NSArray<Class> *)classes andTheirTitles:(NSArray<NSString *> *)titles {
+    if (self = [self initWithNibName:nil bundle:nil]) {
+        NSParameterAssert(classes.count == titles.count);
+        _viewControllerClasses = [NSArray arrayWithArray:classes];
+        _titles = [NSArray arrayWithArray:titles];
     }
+    return self;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(wm_growCachePolicyAfterMemoryWarning) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(wm_growCachePolicyToHigh) object:nil];
 }
 
 - (void)forceLayoutSubviews {
-    _hasInited = NO;
-    [self viewDidLayoutSubviews];
+    if (!self.childControllersCount) return;
+    // 计算宽高及子控制器的视图frame
+    [self wm_calculateSize];
+    [self wm_adjustScrollViewFrame];
+    [self wm_adjustMenuViewFrame];
+    [self wm_adjustDisplayingViewControllersFrame];
 }
 
 - (void)setScrollEnable:(BOOL)scrollEnable {
@@ -135,6 +132,12 @@ static NSInteger const kWMControllerCountUndefined = -1;
         [self.menuView selectItemAtIndex:selectIndex];
     } else {
         _markedSelectIndex = selectIndex;
+        UIViewController *vc = [self.memCache objectForKey:@(selectIndex)];
+        if (!vc) {
+            vc = [self initializeViewControllerAtIndex:selectIndex];
+            [self.memCache setObject:vc forKey:@(selectIndex)];
+        }
+        self.currentViewController = vc;
     }
 }
 
@@ -179,6 +182,7 @@ static NSInteger const kWMControllerCountUndefined = -1;
     [self.memCache removeAllObjects];
     [self wm_resetMenuView];
     [self viewDidLayoutSubviews];
+    [self didEnterController:self.currentViewController atIndex:self.selectIndex];
 }
 
 - (void)updateTitle:(NSString *)title atIndex:(NSInteger)index {
@@ -262,6 +266,10 @@ static NSInteger const kWMControllerCountUndefined = -1;
 // 完全进入控制器 (即停止滑动后调用)
 - (void)didEnterController:(UIViewController *)vc atIndex:(NSInteger)index {
     if (!self.childControllersCount) return;
+    
+    // Post FullyDisplayedNotification
+    [self wm_postFullyDisplayedNotificationWithCurrentIndex:self.selectIndex];
+    
     NSDictionary *info = [self infoWithIndex:index];
     if ([self.delegate respondsToSelector:@selector(pageController:didEnterViewController:withInfo:)]) {
         [self.delegate pageController:self didEnterViewController:vc withInfo:info];
@@ -363,7 +371,8 @@ static NSInteger const kWMControllerCountUndefined = -1;
                            @"title":[self titleAtIndex:index]
                            };
     [[NSNotificationCenter defaultCenter] postNotificationName:WMControllerDidAddToSuperViewNotification
-                                                        object:info];
+                                                        object:self
+                                                      userInfo:info];
 }
 
 // 当子控制器完全展示在user面前时发送通知
@@ -374,7 +383,8 @@ static NSInteger const kWMControllerCountUndefined = -1;
                            @"title":[self titleAtIndex:index]
                            };
     [[NSNotificationCenter defaultCenter] postNotificationName:WMControllerDidFullyDisplayedNotification
-                                                        object:info];
+                                                        object:self
+                                                      userInfo:info];
 }
 
 // 初始化一些参数，在init中调用
@@ -390,6 +400,8 @@ static NSInteger const kWMControllerCountUndefined = -1;
     _markedSelectIndex = kWMUndefinedIndex;
     _controllerCount  = kWMControllerCountUndefined;
     _scrollEnable = YES;
+    _progressViewCornerRadius = WMUNDEFINED_VALUE;
+    _progressHeight = WMUNDEFINED_VALUE;
     
     self.automaticallyCalculatesItemWidths = NO;
     self.automaticallyAdjustsScrollViewInsets = NO;
@@ -405,20 +417,8 @@ static NSInteger const kWMControllerCountUndefined = -1;
 
 // 包括宽高，子控制器视图 frame
 - (void)wm_calculateSize {
-    if ([self.dataSource respondsToSelector:@selector(pageController:preferredFrameForMenuView:)]) {
-        _menuViewFrame = [self.dataSource pageController:self preferredFrameForMenuView:self.menuView];
-    } else {
-        CGFloat originY = (self.showOnNavigationBar && self.navigationController.navigationBar) ? 0 : CGRectGetMaxY(self.navigationController.navigationBar.frame);
-        _menuViewFrame = CGRectMake(0, originY, self.view.frame.size.width, 30.0f);
-    }
-    if ([self.dataSource respondsToSelector:@selector(pageController:preferredFrameForContentView:)]) {
-        _contentViewFrame = [self.dataSource pageController:self preferredFrameForContentView:self.scrollView];
-    } else {
-        CGFloat originY = (self.showOnNavigationBar && self.navigationController.navigationBar) ? CGRectGetMaxY(self.navigationController.navigationBar.frame) : CGRectGetMaxY(_menuViewFrame);
-        CGFloat tabBarHeight = self.tabBarController.tabBar && !self.tabBarController.tabBar.hidden ? self.tabBarController.tabBar.frame.size.height : 0;
-        CGFloat sizeHeight = self.view.frame.size.height - tabBarHeight - originY;
-        _contentViewFrame = CGRectMake(0, originY, self.view.frame.size.width, sizeHeight);
-    }
+    _menuViewFrame = [self.dataSource pageController:self preferredFrameForMenuView:self.menuView];
+    _contentViewFrame = [self.dataSource pageController:self preferredFrameForContentView:self.scrollView];
     _childViewFrames = [NSMutableArray array];
     for (int i = 0; i < self.childControllersCount; i++) {
         CGRect frame = CGRectMake(i * _contentViewFrame.size.width, 0, _contentViewFrame.size.width, _contentViewFrame.size.height);
@@ -436,6 +436,9 @@ static NSInteger const kWMControllerCountUndefined = -1;
     scrollView.showsHorizontalScrollIndicator = NO;
     scrollView.bounces = self.bounces;
     scrollView.scrollEnabled = self.scrollEnable;
+    if (@available(iOS 11.0, *)) {
+        scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    }
     [self.view addSubview:scrollView];
     self.scrollView = scrollView;
     
@@ -457,6 +460,7 @@ static NSInteger const kWMControllerCountUndefined = -1;
     menuView.progressWidths = self.progressViewWidths;
     menuView.progressViewIsNaughty = self.progressViewIsNaughty;
     menuView.progressViewCornerRadius = self.progressViewCornerRadius;
+    menuView.showOnNavigationBar = self.showOnNavigationBar;
     if (self.titleFontName) {
         menuView.fontName = self.titleFontName;
     }
@@ -630,10 +634,6 @@ static NSInteger const kWMControllerCountUndefined = -1;
     self.cachePolicy = WMPageControllerCachePolicyHigh;
 }
 
-- (UIView *)wm_bottomView {
-    return self.tabBarController.tabBar ? self.tabBarController.tabBar : self.navigationController.toolbar;
-}
-
 #pragma mark - Adjust Frame
 - (void)wm_adjustScrollViewFrame {
     // While rotate at last page, set scroll frame will call `-scrollViewDidScroll:` delegate
@@ -687,40 +687,19 @@ static NSInteger const kWMControllerCountUndefined = -1;
     if (!self.childControllersCount) return;
     [self wm_calculateSize];
     [self wm_addScrollView];
-    [self wm_addViewControllerAtIndex:self.selectIndex];
+    [self wm_initializedControllerWithIndexIfNeeded:self.selectIndex];
     self.currentViewController = self.displayVC[@(self.selectIndex)];
     [self wm_addMenuView];
+    [self didEnterController:self.currentViewController atIndex:self.selectIndex];
 }
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     
     if (!self.childControllersCount) return;
-    
-    CGFloat oldSuperviewHeight = _superviewHeight;
-    _superviewHeight = self.view.frame.size.height;
-    BOOL oldTabBarIsHidden = _isTabBarHidden;
-    _isTabBarHidden = [self wm_bottomView].hidden;
-    
-    BOOL shouldNotLayout = (_hasInited && _superviewHeight == oldSuperviewHeight && _isTabBarHidden == oldTabBarIsHidden);
-    if (shouldNotLayout) return;
-    // 计算宽高及子控制器的视图frame
-    [self wm_calculateSize];
-    [self wm_adjustScrollViewFrame];
-    [self wm_adjustMenuViewFrame];
-    [self wm_adjustDisplayingViewControllersFrame];
+    [self forceLayoutSubviews];
     _hasInited = YES;
-    [self.view layoutIfNeeded];
     [self wm_delaySelectIndexIfNeeded];
-}
-
-- (void)viewDidAppear:(BOOL)animated {
-    [super viewDidAppear:animated];
-    
-    if (!self.childControllersCount) return;
-    
-    [self wm_postFullyDisplayedNotificationWithCurrentIndex:self.selectIndex];
-    [self didEnterController:self.currentViewController atIndex:self.selectIndex];
 }
 
 - (void)didReceiveMemoryWarning {
@@ -781,7 +760,6 @@ static NSInteger const kWMControllerCountUndefined = -1;
     self.menuView.userInteractionEnabled = YES;
     _selectIndex = (int)(scrollView.contentOffset.x / _contentViewFrame.size.width);
     self.currentViewController = self.displayVC[@(self.selectIndex)];
-    [self wm_postFullyDisplayedNotificationWithCurrentIndex:self.selectIndex];
     [self didEnterController:self.currentViewController atIndex:self.selectIndex];
     [self.menuView deselectedItemsIfNeeded];
 }
@@ -790,7 +768,6 @@ static NSInteger const kWMControllerCountUndefined = -1;
     if (![scrollView isKindOfClass:WMScrollView.class]) return;
     
     self.currentViewController = self.displayVC[@(self.selectIndex)];
-    [self wm_postFullyDisplayedNotificationWithCurrentIndex:self.selectIndex];
     [self didEnterController:self.currentViewController atIndex:self.selectIndex];
     [self.menuView deselectedItemsIfNeeded];
 }
@@ -813,7 +790,7 @@ static NSInteger const kWMControllerCountUndefined = -1;
 }
 
 #pragma mark - WMMenuView Delegate
-- (void)menuView:(WMMenuView *)menu didSelesctedIndex:(NSInteger)index currentIndex:(NSInteger)currentIndex {
+- (void)menuView:(WMMenuView *)menu didSelectedIndex:(NSInteger)index currentIndex:(NSInteger)currentIndex {
     if (!_hasInited) return;
     _selectIndex = (int)index;
     _startDragging = NO;
@@ -827,7 +804,7 @@ static NSInteger const kWMControllerCountUndefined = -1;
     }
     [self wm_layoutChildViewControllers];
     self.currentViewController = self.displayVC[@(self.selectIndex)];
-    [self wm_postFullyDisplayedNotificationWithCurrentIndex:(int)index];
+    
     [self didEnterController:self.currentViewController atIndex:index];
 }
 
@@ -851,27 +828,15 @@ static NSInteger const kWMControllerCountUndefined = -1;
 
 - (CGFloat)menuView:(WMMenuView *)menu titleSizeForState:(WMMenuItemState)state atIndex:(NSInteger)index {
     switch (state) {
-        case WMMenuItemStateSelected: {
-            return self.titleSizeSelected;
-            break;
-        }
-        case WMMenuItemStateNormal: {
-            return self.titleSizeNormal;
-            break;
-        }
+        case WMMenuItemStateSelected: return self.titleSizeSelected;
+        case WMMenuItemStateNormal: return self.titleSizeNormal;
     }
 }
 
 - (UIColor *)menuView:(WMMenuView *)menu titleColorForState:(WMMenuItemState)state atIndex:(NSInteger)index {
     switch (state) {
-        case WMMenuItemStateSelected: {
-            return self.titleColorSelected;
-            break;
-        }
-        case WMMenuItemStateNormal: {
-            return self.titleColorNormal;
-            break;
-        }
+        case WMMenuItemStateSelected: return self.titleColorSelected;
+        case WMMenuItemStateNormal: return self.titleColorNormal;
     }
 }
 
@@ -882,6 +847,17 @@ static NSInteger const kWMControllerCountUndefined = -1;
 
 - (NSString *)menuView:(WMMenuView *)menu titleAtIndex:(NSInteger)index {
     return [self titleAtIndex:index];
+}
+
+#pragma mark - WMPageControllerDataSource
+- (CGRect)pageController:(WMPageController *)pageController preferredFrameForMenuView:(WMMenuView *)menuView {
+    NSAssert(0, @"[%@] MUST IMPLEMENT DATASOURCE METHOD `-pageController:preferredFrameForMenuView:`", [self.dataSource class]);
+    return CGRectZero;
+}
+
+- (CGRect)pageController:(WMPageController *)pageController preferredFrameForContentView:(WMScrollView *)contentView {
+    NSAssert(0, @"[%@] MUST IMPLEMENT DATASOURCE METHOD `-pageController:preferredFrameForContentView:`", [self.dataSource class]);
+    return CGRectZero;
 }
 
 @end
